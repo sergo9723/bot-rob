@@ -7,8 +7,8 @@ import hashlib
 app = Flask(__name__)
 
 # ===== НАСТРОЙКИ =====
-API_KEY = duCsrGgCF3ilnAQJDV
-API_SECRET = F8X5iARZIPTiTlaxX05oNxRqr38MBSD897c5
+API_KEY = "duCsrGgCF3ilnAQJDV"
+API_SECRET = "F8X5iARZIPTiTlaxX05oNxRqr38MBSD897c5"
 
 BASE_URL = "https://api.bybit.com"
 
