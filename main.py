@@ -7,218 +7,266 @@ from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-# -------------------------
+# =======================
 # ENV (Render -> Environment)
-# -------------------------
+# =======================
+TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() in ("1", "true", "yes", "y")
+BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
 
-# Секрет для TradingView webhook (должен совпадать с тем, что ты вставляешь в Alert message)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "xrp12345")
+DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "XRPUSDT")
+DEFAULT_USD = float(os.getenv("DEFAULT_USD", "3.5"))
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
-# По умолчанию
-DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))     # 5x
-DEFAULT_MARGIN_USD = float(os.getenv("DEFAULT_MARGIN_USD", "3.5"))  # 3.5 USDT маржи
+# ПУНКТ 2: TP/SL по умолчанию (в процентах)
+DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))  # например 0.55%
+DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))  # например 0.35%
 
-# Защита от спама/дублей (сек)
-DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "5"))
-
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    # Render покажет это в логах, чтобы ты понял, что забыл переменные окружения
-    print("WARNING: BYBIT_API_KEY/BYBIT_API_SECRET not set in environment variables!")
-
+# Bybit session (Unified Trading)
 session = HTTP(
     testnet=BYBIT_TESTNET,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
 )
 
-# Кэш информации по инструментам (шаг количества)
-_instrument_cache = {}  # symbol -> (qty_step_decimal, ts)
-INSTR_CACHE_TTL = 60 * 10  # 10 минут
+# Кэш фильтров инструмента
+_instrument_cache = {}  # symbol -> dict(filters..., ts)
+CACHE_TTL = 60 * 10  # 10 минут
 
-# Дедупликация
-_last_signal = {}  # symbol -> (side, ts)
+
+def ok(msg, **extra):
+    data = {"ok": True, "msg": msg}
+    data.update(extra)
+    return jsonify(data), 200
+
+
+def bad(msg, code=400, **extra):
+    data = {"ok": False, "msg": msg}
+    data.update(extra)
+    return jsonify(data), code
 
 
 def _now() -> int:
     return int(time.time())
 
 
-def _json_error(msg: str, code: int = 400):
-    return jsonify({"ok": False, "error": msg}), code
-
-
-def _get_qty_step(symbol: str) -> Decimal:
-    """Получаем шаг количества (qtyStep) для округления qty."""
+def get_instrument_filters(symbol: str):
+    """
+    Возвращает qtyStep и tickSize как Decimal для корректного округления.
+    """
     cached = _instrument_cache.get(symbol)
-    if cached:
-        step, ts = cached
-        if _now() - ts < INSTR_CACHE_TTL:
-            return step
+    if cached and (_now() - cached["ts"] < CACHE_TTL):
+        return cached["qty_step"], cached["tick_size"]
 
-    resp = session.get_instruments_info(
-        category="linear",
-        symbol=symbol
-    )
+    r = session.get_instruments_info(category="linear", symbol=symbol)
+    if r.get("retCode") != 0:
+        raise RuntimeError(f"Bybit get_instruments_info error: {r}")
 
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"get_instruments_info failed: {resp}")
-
-    lst = (resp.get("result") or {}).get("list") or []
+    lst = (r.get("result") or {}).get("list") or []
     if not lst:
-        raise RuntimeError(f"instrument not found for {symbol}")
+        raise RuntimeError(f"Instrument not found: {symbol}")
 
-    lot = (lst[0].get("lotSizeFilter") or {})
-    qty_step = lot.get("qtyStep")
-    if not qty_step:
-        # на всякий случай
-        qty_step = "0.1"
+    item = lst[0]
+    lot = item.get("lotSizeFilter") or {}
+    pf = item.get("priceFilter") or {}
 
-    step_dec = Decimal(str(qty_step))
-    _instrument_cache[symbol] = (step_dec, _now())
-    return step_dec
+    qty_step = Decimal(str(lot.get("qtyStep", "0.1")))
+    tick_size = Decimal(str(pf.get("tickSize", "0.0001")))
+
+    _instrument_cache[symbol] = {
+        "qty_step": qty_step,
+        "tick_size": tick_size,
+        "ts": _now()
+    }
+    return qty_step, tick_size
 
 
-def _round_qty(qty: Decimal, step: Decimal) -> Decimal:
-    """Округляем вниз к шагу."""
+def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """
+    Округление вниз к кратности step: floor(value/step)*step
+    """
     if step <= 0:
-        return qty
-    return (qty / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
+        return value
+    return (value / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
 
 
-def _get_last_price(symbol: str) -> Decimal:
-    resp = session.get_tickers(category="linear", symbol=symbol)
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"get_tickers failed: {resp}")
-    lst = (resp.get("result") or {}).get("list") or []
+def get_last_price(symbol: str) -> Decimal:
+    r = session.get_tickers(category="linear", symbol=symbol)
+    if r.get("retCode") != 0:
+        raise RuntimeError(f"Bybit get_tickers error: {r}")
+    lst = (r.get("result") or {}).get("list") or []
     if not lst:
-        raise RuntimeError(f"ticker not found for {symbol}")
-    last_price = lst[0].get("lastPrice")
-    if not last_price:
-        raise RuntimeError(f"no lastPrice for {symbol}")
-    return Decimal(str(last_price))
+        raise RuntimeError("No ticker data")
+    return Decimal(str(lst[0].get("lastPrice")))
 
 
-def _set_leverage(symbol: str, leverage: int):
-    # Bybit требует строку
-    lev = str(int(leverage))
-    resp = session.set_leverage(
+def set_leverage(symbol: str, leverage: int):
+    r = session.set_leverage(
         category="linear",
         symbol=symbol,
-        buyLeverage=lev,
-        sellLeverage=lev
+        buyLeverage=str(leverage),
+        sellLeverage=str(leverage),
     )
-    # set_leverage может вернуть retCode=0 даже если уже стоит то же значение
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"set_leverage failed: {resp}")
+    # Иногда Bybit возвращает код типа "не изменилось" — это не критично
+    if r.get("retCode") not in (0, 110043):
+        raise RuntimeError(f"Bybit set_leverage error: {r}")
 
 
-def _place_market_order(symbol: str, side: str, margin_usd: float, leverage: int):
+def get_open_position_size(symbol: str) -> float:
     """
-    margin_usd = сколько USDT маржи на сделку
-    notional = margin_usd * leverage
+    ПУНКТ 1: проверка открытой позиции.
+    Возвращает суммарный abs(size) по символу.
+    """
+    r = session.get_positions(category="linear", symbol=symbol)
+    if r.get("retCode") != 0:
+        raise RuntimeError(f"Bybit get_positions error: {r}")
+
+    pos_list = (r.get("result") or {}).get("list") or []
+    total = 0.0
+    for p in pos_list:
+        total += abs(float(p.get("size") or 0))
+    return total
+
+
+def calc_tp_sl_prices(entry_price: Decimal, side: str, tp_pct: float, sl_pct: float, tick_size: Decimal):
+    """
+    ПУНКТ 2: расчёт TP/SL в процентах и округление по tickSize.
+    side: "Buy" / "Sell"
+    """
+    tp_p = Decimal(str(tp_pct)) / Decimal("100")
+    sl_p = Decimal(str(sl_pct)) / Decimal("100")
+
+    if side == "Buy":
+        tp = entry_price * (Decimal("1") + tp_p)
+        sl = entry_price * (Decimal("1") - sl_p)
+    else:
+        tp = entry_price * (Decimal("1") - tp_p)
+        sl = entry_price * (Decimal("1") + sl_p)
+
+    # Округлим вниз по tick_size (чтобы Bybit точно принял)
+    tp = round_down_to_step(tp, tick_size)
+    sl = round_down_to_step(sl, tick_size)
+
+    return tp, sl
+
+
+def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: int, tp_pct: float, sl_pct: float):
+    """
+    Market-ордер + TP/SL.
+    usd = маржа на сделку
+    notional = usd * leverage
     qty = notional / price
     """
-    price = _get_last_price(symbol)
-    notional = Decimal(str(margin_usd)) * Decimal(str(leverage))
-    raw_qty = notional / price
+    set_leverage(symbol, leverage)
 
-    step = _get_qty_step(symbol)
-    qty = _round_qty(raw_qty, step)
+    price = get_last_price(symbol)
+    qty_step, tick_size = get_instrument_filters(symbol)
+
+    notional = Decimal(str(usd)) * Decimal(str(leverage))
+    raw_qty = notional / price
+    qty = round_down_to_step(raw_qty, qty_step)
 
     if qty <= 0:
-        raise RuntimeError(f"qty computed <= 0 (raw_qty={raw_qty}, step={step})")
+        raise RuntimeError(f"Bad qty computed: raw={raw_qty}, step={qty_step}, qty={qty}")
 
-    # MARKET ордер
-    resp = session.place_order(
+    tp_price, sl_price = calc_tp_sl_prices(price, side, tp_pct, sl_pct, tick_size)
+
+    r = session.place_order(
         category="linear",
         symbol=symbol,
         side=side,               # "Buy" / "Sell"
         orderType="Market",
         qty=str(qty),
         timeInForce="IOC",
-        reduceOnly=False
+        reduceOnly=False,
+
+        # TP/SL сразу в ордере
+        takeProfit=str(tp_price),
+        stopLoss=str(sl_price),
+
+        # По умолчанию Bybit использует LastPrice/MarkPrice в зависимости от настроек.
+        # Если понадобится — добавим tpslMode / tpTriggerBy / slTriggerBy.
     )
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"place_order failed: {resp}")
+
+    if r.get("retCode") != 0:
+        raise RuntimeError(f"Bybit place_order error: {r}")
 
     return {
         "symbol": symbol,
         "side": side,
-        "price": str(price),
-        "margin_usd": margin_usd,
-        "leverage": leverage,
+        "entry_price_used": str(price),
         "qty": str(qty),
-        "bybit": resp
+        "tp_price": str(tp_price),
+        "sl_price": str(sl_price),
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
+        "raw": r,
     }
+
+
+@app.get("/")
+def home():
+    return "OK", 200
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "time": _now(), "testnet": BYBIT_TESTNET})
+    return jsonify({"ok": True, "testnet": BYBIT_TESTNET}), 200
 
 
 @app.post("/webhook")
 def webhook():
-    # TradingView шлёт JSON
-    data = request.get_json(silent=True)
-    if not data:
-        return _json_error("No JSON body")
+    data = request.get_json(silent=True) or {}
 
     # 1) секрет
-    secret = str(data.get("secret", ""))
-    if secret != WEBHOOK_SECRET:
-        return _json_error("Bad secret", 403)
+    secret = data.get("secret", "")
+    if not TV_WEBHOOK_SECRET or secret != TV_WEBHOOK_SECRET:
+        return bad("Bad secret", 401)
 
     # 2) symbol
-    symbol = str(data.get("symbol", "")).upper().strip()
+    symbol = str(data.get("symbol", DEFAULT_SYMBOL)).upper().strip()
     if not symbol:
-        return _json_error("Missing symbol")
+        return bad("Missing symbol", 400)
 
-    # 3) side из TradingView
-    # В твоём алерте side = "{{strategy.order.action}}"
-    # TradingView обычно шлёт BUY / SELL
-    raw_side = str(data.get("side", "")).strip().lower()
-    if raw_side in ("buy", "long"):
+    # 3) side (TradingView: BUY/SELL)
+    side_raw = str(data.get("side", "")).lower().strip()
+    if side_raw in ("buy", "long"):
         side = "Buy"
-    elif raw_side in ("sell", "short"):
+    elif side_raw in ("sell", "short"):
         side = "Sell"
     else:
-        return _json_error(f"Bad side: {data.get('side')} (expected BUY/SELL)")
+        return bad("Bad side. Use buy/sell", 400, got=side_raw)
 
-    # 4) деньги и плечо
-    margin_usd = float(data.get("usd", DEFAULT_MARGIN_USD))
+    usd = float(data.get("usd", DEFAULT_USD))
     leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
 
-    if margin_usd <= 0:
-        return _json_error("usd must be > 0")
-    if leverage < 1 or leverage > 100:
-        return _json_error("leverage out of range")
+    # ПУНКТ 2: tp_pct / sl_pct (в процентах)
+    tp_pct = float(data.get("tp_pct", DEFAULT_TP_PCT))
+    sl_pct = float(data.get("sl_pct", DEFAULT_SL_PCT))
 
-    # 5) дедуп (если одинаковый сигнал подряд за N секунд)
-    last = _last_signal.get(symbol)
-    now = _now()
-    if last:
-        last_side, last_ts = last
-        if last_side == side and (now - last_ts) <= DEDUP_WINDOW_SEC:
-            return jsonify({"ok": True, "skipped": True, "reason": "duplicate", "symbol": symbol, "side": side})
+    if usd <= 0:
+        return bad("usd must be > 0", 400)
+    if leverage < 1 or leverage > 100:
+        return bad("leverage out of range", 400)
+    if tp_pct <= 0 or sl_pct <= 0:
+        return bad("tp_pct and sl_pct must be > 0", 400)
 
     try:
-        # leverage на символ
-        _set_leverage(symbol, leverage)
+        # === ПУНКТ 1: одна позиция на символ ===
+        open_size = get_open_position_size(symbol)
+        if open_size > 0:
+            return ok("Position already open -> skip", symbol=symbol, open_size=open_size)
 
-        result = _place_market_order(symbol, side, margin_usd, leverage)
-
-        _last_signal[symbol] = (side, now)
-        return jsonify({"ok": True, "executed": True, "result": result})
+        # === ПУНКТ 2: Market + TP/SL ===
+        res = place_market_order_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
+        return ok("Order placed with TP/SL", **res)
 
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return bad("Exception", 500, error=str(e), symbol=symbol)
 
 
 if __name__ == "__main__":
-    # Локально: python main.py
-    port = int(os.getenv("PORT", "10000"))
+    # локально
+    port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
