@@ -6,6 +6,11 @@ from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
+import logging
+import traceback
+from flask import request, jsonify
+
+logging.basicConfig(level=logging.INFO)
 
 # =======================
 # ENV (Render -> Environment)
@@ -217,6 +222,25 @@ def health():
 
 @app.post("/webhook")
 def webhook():
+    try:
+        # Логируем вход
+        logging.info("Webhook headers: %s", dict(request.headers))
+        raw = request.get_data(as_text=True)
+        logging.info("Webhook raw body: %s", raw)
+
+        data = request.get_json(silent=True) or {}
+        logging.info("Webhook json: %s", data)
+
+        # --- ТВОЯ ЛОГИКА (секрет, symbol, side, bybit, tp/sl и т.д.) ---
+        # return jsonify({...}), 200
+
+        return jsonify({"ok": True, "msg": "webhook received"}), 200
+
+    except Exception as e:
+        logging.error("WEBHOOK ERROR: %s", str(e))
+        logging.error(traceback.format_exc())
+        return jsonify({"ok": False, "error": "internal_error", "hint": "check Render logs"}), 500
+
     data = request.get_json(silent=True) or {}
 
     # 1) секрет
