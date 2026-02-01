@@ -32,9 +32,9 @@ session = HTTP(
     api_secret=BYBIT_API_SECRET,
 )
 
-# Cache
-_instrument_cache = {}
-CACHE_TTL = 60 * 10  # 10 minutes
+# Кэш фильтров инструмента
+_instrument_cache = {}  # symbol -> dict(filters..., ts)
+CACHE_TTL = 60 * 10  # 10 минут
 
 
 def ok(msg, **extra):
@@ -54,6 +54,9 @@ def _now() -> int:
 
 
 def get_instrument_filters(symbol: str):
+    """
+    Возвращает qtyStep и tickSize как Decimal для корректного округления.
+    """
     cached = _instrument_cache.get(symbol)
     if cached and (_now() - cached["ts"] < CACHE_TTL):
         return cached["qty_step"], cached["tick_size"]
@@ -73,11 +76,18 @@ def get_instrument_filters(symbol: str):
     qty_step = Decimal(str(lot.get("qtyStep", "0.1")))
     tick_size = Decimal(str(pf.get("tickSize", "0.0001")))
 
-    _instrument_cache[symbol] = {"qty_step": qty_step, "tick_size": tick_size, "ts": _now()}
+    _instrument_cache[symbol] = {
+        "qty_step": qty_step,
+        "tick_size": tick_size,
+        "ts": _now(),
+    }
     return qty_step, tick_size
 
 
 def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """
+    Округление вниз к кратности step: floor(value/step)*step
+    """
     if step <= 0:
         return value
     return (value / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
@@ -95,8 +105,8 @@ def get_last_price(symbol: str) -> Decimal:
 
 def set_leverage(symbol: str, leverage: int):
     """
-    FIX: Bybit 110043 = leverage not modified (already set).
-    pybit may raise InvalidRequestError, so we must catch it.
+    ВАЖНО: pybit может кидать исключение даже на 110043.
+    110043 = leverage not modified (это НЕ ошибка).
     """
     try:
         r = session.set_leverage(
@@ -105,21 +115,24 @@ def set_leverage(symbol: str, leverage: int):
             buyLeverage=str(leverage),
             sellLeverage=str(leverage),
         )
-
-        # If pybit returns a dict, still handle it.
-        if isinstance(r, dict) and r.get("retCode") not in (0, 110043):
+        # если вернулось нормально:
+        if r.get("retCode") not in (0, 110043):
             raise RuntimeError(f"Bybit set_leverage error: {r}")
-
+        return
     except Exception as e:
-        # pybit exception text usually contains ErrCode
-        s = str(e)
-        if "ErrCode: 110043" in s or "110043" in s:
-            logging.info("Leverage already set (%sx) -> continue. (%s)", leverage, s)
+        msg = str(e)
+        # Игнорируем "не изменилось"
+        if ("110043" in msg) or ("leverage not modified" in msg.lower()):
+            logging.info("Leverage already set (110043) -> ignore")
             return
         raise
 
 
 def get_open_position_size(symbol: str) -> float:
+    """
+    Проверка открытой позиции.
+    Возвращает суммарный abs(size) по символу.
+    """
     r = session.get_positions(category="linear", symbol=symbol)
     if r.get("retCode") != 0:
         raise RuntimeError(f"Bybit get_positions error: {r}")
@@ -165,7 +178,7 @@ def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: i
     r = session.place_order(
         category="linear",
         symbol=symbol,
-        side=side,  # "Buy"/"Sell"
+        side=side,               # "Buy" / "Sell"
         orderType="Market",
         qty=str(qty),
         timeInForce="IOC",
@@ -200,6 +213,45 @@ def health():
     return jsonify({"ok": True, "testnet": BYBIT_TESTNET}), 200
 
 
+@app.get("/ready")
+def ready():
+    """
+    ЧЕК-КОД: проверка готовности (ключи/режим/testnet/доступ к данным Bybit)
+    """
+    try:
+        missing = []
+        if not TV_WEBHOOK_SECRET:
+            missing.append("TV_WEBHOOK_SECRET")
+        if not BYBIT_API_KEY:
+            missing.append("BYBIT_API_KEY")
+        if not BYBIT_API_SECRET:
+            missing.append("BYBIT_API_SECRET")
+
+        symbol = DEFAULT_SYMBOL
+
+        # Проверим, что Bybit отвечает
+        price = get_last_price(symbol)
+        qty_step, tick_size = get_instrument_filters(symbol)
+
+        return jsonify({
+            "ok": True,
+            "mode": "TESTNET" if BYBIT_TESTNET else "REAL",
+            "missing_env": missing,
+            "default_symbol": symbol,
+            "last_price": str(price),
+            "qty_step": str(qty_step),
+            "tick_size": str(tick_size),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "mode": "TESTNET" if BYBIT_TESTNET else "REAL",
+            "error": str(e),
+            "hint": "Check Render logs and verify keys/permissions/symbol"
+        }), 500
+
+
 @app.post("/webhook")
 def webhook():
     try:
@@ -207,21 +259,16 @@ def webhook():
         raw = request.get_data(as_text=True)
         logging.info("Webhook raw body: %s", raw)
 
+        # Защита: если не JSON — сразу ошибка
+        if not request.is_json:
+            return bad("Expected application/json from TradingView", 415, got_content_type=request.content_type)
+
         data = request.get_json(silent=True) or {}
         logging.info("Webhook json: %s", data)
 
-        # FIX: if TradingView sent plain text, not JSON
-        if not data:
-            return bad(
-                "Expected JSON body. TradingView alert 'Message' must be JSON.",
-                400,
-                hint="In TradingView Alert: Condition=Any alert() function call, Message can be empty (alert() sends JSON).",
-                got_preview=raw[:200],
-            )
-
         # 1) secret
-        secret = str(data.get("secret", "")).strip()
-        if not TV_WEBHOOK_SECRET or secret != TV_WEBHOOK_SECRET:
+        secret = str(data.get("secret", ""))
+        if (not TV_WEBHOOK_SECRET) or (secret != TV_WEBHOOK_SECRET):
             return bad("Bad secret", 401)
 
         # 2) symbol
@@ -229,14 +276,16 @@ def webhook():
         if not symbol:
             return bad("Missing symbol", 400)
 
-        # 3) side
-        side_raw = str(data.get("side", "")).lower().strip()
-        if side_raw in ("buy", "long"):
+        # 3) side (STRICT: BUY/SELL or buy/sell/long/short)
+        side_raw = str(data.get("side", "")).strip()
+        side_l = side_raw.lower()
+
+        if side_l in ("buy", "long"):
             side = "Buy"
-        elif side_raw in ("sell", "short"):
+        elif side_l in ("sell", "short"):
             side = "Sell"
         else:
-            return bad("Bad side. Use buy/sell", 400, got=side_raw)
+            return bad("Bad side. Use BUY/SELL", 400, got=side_raw)
 
         usd = float(data.get("usd", DEFAULT_USD))
         leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
@@ -250,18 +299,19 @@ def webhook():
         if tp_pct <= 0 or sl_pct <= 0:
             return bad("tp_pct and sl_pct must be > 0", 400)
 
-        # One position per symbol
+        # Одна позиция на символ
         open_size = get_open_position_size(symbol)
         if open_size > 0:
             return ok("Position already open -> skip", symbol=symbol, open_size=open_size)
 
+        # Открываем Market + TP/SL
         res = place_market_order_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
         return ok("Order placed with TP/SL", **res)
 
     except Exception as e:
         logging.error("WEBHOOK ERROR: %s", str(e))
         logging.error(traceback.format_exc())
-        return bad("Exception", 500, error=str(e))
+        return jsonify({"ok": False, "error": "internal_error", "detail": str(e)}), 500
 
 
 if __name__ == "__main__":
