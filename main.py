@@ -1,15 +1,13 @@
 import os
 import time
+import logging
+import traceback
 from decimal import Decimal, ROUND_DOWN
 
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
-import logging
-import traceback
-from flask import request, jsonify
-
 logging.basicConfig(level=logging.INFO)
 
 # =======================
@@ -24,9 +22,9 @@ DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "XRPUSDT")
 DEFAULT_USD = float(os.getenv("DEFAULT_USD", "3.5"))
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
-# ПУНКТ 2: TP/SL по умолчанию (в процентах)
-DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))  # например 0.55%
-DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))  # например 0.35%
+# TP/SL по умолчанию (в процентах)
+DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))  # 0.55%
+DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))  # 0.35%
 
 # Bybit session (Unified Trading)
 session = HTTP(
@@ -79,11 +77,7 @@ def get_instrument_filters(symbol: str):
     qty_step = Decimal(str(lot.get("qtyStep", "0.1")))
     tick_size = Decimal(str(pf.get("tickSize", "0.0001")))
 
-    _instrument_cache[symbol] = {
-        "qty_step": qty_step,
-        "tick_size": tick_size,
-        "ts": _now()
-    }
+    _instrument_cache[symbol] = {"qty_step": qty_step, "tick_size": tick_size, "ts": _now()}
     return qty_step, tick_size
 
 
@@ -118,25 +112,31 @@ def set_leverage(symbol: str, leverage: int):
         raise RuntimeError(f"Bybit set_leverage error: {r}")
 
 
-def get_open_position_size(symbol: str) -> float:
+def get_position(symbol: str):
     """
-    ПУНКТ 1: проверка открытой позиции.
-    Возвращает суммарный abs(size) по символу.
+    Возвращает (side, size) по oneway.
+    side: "Buy"/"Sell"/None
+    size: float
     """
     r = session.get_positions(category="linear", symbol=symbol)
     if r.get("retCode") != 0:
         raise RuntimeError(f"Bybit get_positions error: {r}")
 
     pos_list = (r.get("result") or {}).get("list") or []
-    total = 0.0
+    # Для oneway обычно одна позиция, но мы аккуратно найдём любую с size>0
+    best_side = None
+    best_size = 0.0
     for p in pos_list:
-        total += abs(float(p.get("size") or 0))
-    return total
+        size = float(p.get("size") or 0)
+        if size > 0 and size > best_size:
+            best_size = size
+            best_side = p.get("side")  # "Buy" или "Sell"
+    return best_side, best_size
 
 
 def calc_tp_sl_prices(entry_price: Decimal, side: str, tp_pct: float, sl_pct: float, tick_size: Decimal):
     """
-    ПУНКТ 2: расчёт TP/SL в процентах и округление по tickSize.
+    Расчёт TP/SL в процентах и округление по tickSize.
     side: "Buy" / "Sell"
     """
     tp_p = Decimal(str(tp_pct)) / Decimal("100")
@@ -156,17 +156,12 @@ def calc_tp_sl_prices(entry_price: Decimal, side: str, tp_pct: float, sl_pct: fl
     return tp, sl
 
 
-def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: int, tp_pct: float, sl_pct: float):
+def compute_qty(symbol: str, usd: float, leverage: int):
     """
-    Market-ордер + TP/SL.
-    usd = маржа на сделку
-    notional = usd * leverage
-    qty = notional / price
+    qty = (usd * leverage) / price, округление по qtyStep
     """
-    set_leverage(symbol, leverage)
-
     price = get_last_price(symbol)
-    qty_step, tick_size = get_instrument_filters(symbol)
+    qty_step, _tick_size = get_instrument_filters(symbol)
 
     notional = Decimal(str(usd)) * Decimal(str(leverage))
     raw_qty = notional / price
@@ -175,6 +170,43 @@ def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: i
     if qty <= 0:
         raise RuntimeError(f"Bad qty computed: raw={raw_qty}, step={qty_step}, qty={qty}")
 
+    return price, qty
+
+
+def close_position_market(symbol: str, pos_side: str, pos_size: float):
+    """
+    ПУНКТ 3: закрыть позицию рыночным reduceOnly.
+    Если pos_side="Buy" (лонг), закрываем Sell.
+    Если pos_side="Sell" (шорт), закрываем Buy.
+    """
+    if pos_size <= 0:
+        return {"closed": False, "reason": "size<=0"}
+
+    close_side = "Sell" if pos_side == "Buy" else "Buy"
+
+    r = session.place_order(
+        category="linear",
+        symbol=symbol,
+        side=close_side,
+        orderType="Market",
+        qty=str(pos_size),
+        timeInForce="IOC",
+        reduceOnly=True,
+    )
+    if r.get("retCode") != 0:
+        raise RuntimeError(f"Bybit close position error: {r}")
+
+    return {"closed": True, "close_side": close_side, "size": pos_size, "raw": r}
+
+
+def open_market_with_tpsl(symbol: str, side: str, usd: float, leverage: int, tp_pct: float, sl_pct: float):
+    """
+    Открыть Market + TP/SL.
+    """
+    set_leverage(symbol, leverage)
+
+    price, qty = compute_qty(symbol, usd, leverage)
+    _qty_step, tick_size = get_instrument_filters(symbol)
     tp_price, sl_price = calc_tp_sl_prices(price, side, tp_pct, sl_pct, tick_size)
 
     r = session.place_order(
@@ -186,12 +218,8 @@ def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: i
         timeInForce="IOC",
         reduceOnly=False,
 
-        # TP/SL сразу в ордере
         takeProfit=str(tp_price),
         stopLoss=str(sl_price),
-
-        # По умолчанию Bybit использует LastPrice/MarkPrice в зависимости от настроек.
-        # Если понадобится — добавим tpslMode / tpTriggerBy / slTriggerBy.
     )
 
     if r.get("retCode") != 0:
@@ -223,7 +251,7 @@ def health():
 @app.post("/webhook")
 def webhook():
     try:
-        # Логируем вход
+        # 0) Логируем вход
         logging.info("Webhook headers: %s", dict(request.headers))
         raw = request.get_data(as_text=True)
         logging.info("Webhook raw body: %s", raw)
@@ -231,66 +259,68 @@ def webhook():
         data = request.get_json(silent=True) or {}
         logging.info("Webhook json: %s", data)
 
-        # --- ТВОЯ ЛОГИКА (секрет, symbol, side, bybit, tp/sl и т.д.) ---
-        # return jsonify({...}), 200
+        # 1) secret
+        secret = str(data.get("secret", "")).strip()
+        if not TV_WEBHOOK_SECRET or secret != TV_WEBHOOK_SECRET:
+            return bad("Bad secret", 401)
 
-        return jsonify({"ok": True, "msg": "webhook received"}), 200
+        # 2) symbol
+        symbol = str(data.get("symbol", DEFAULT_SYMBOL)).upper().strip()
+        if not symbol:
+            return bad("Missing symbol", 400)
+
+        # 3) side (TradingView: BUY/SELL)
+        side_raw = str(data.get("side", "")).strip()
+        side_low = side_raw.lower()
+
+        # защита: если пришёл плейсхолдер — сразу ошибка, чтобы ты увидел, что алерт не “order fills”
+        if "{{" in side_raw or "}}" in side_raw:
+            return bad("Side placeholder not resolved. Create alert from Strategy -> Order fills.", 400, got=side_raw)
+
+        if side_low in ("buy", "long"):
+            side = "Buy"
+        elif side_low in ("sell", "short"):
+            side = "Sell"
+        else:
+            return bad("Bad side. Use BUY/SELL", 400, got=side_raw)
+
+        usd = float(data.get("usd", DEFAULT_USD))
+        leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
+        tp_pct = float(data.get("tp_pct", DEFAULT_TP_PCT))
+        sl_pct = float(data.get("sl_pct", DEFAULT_SL_PCT))
+
+        if usd <= 0:
+            return bad("usd must be > 0", 400)
+        if leverage < 1 or leverage > 100:
+            return bad("leverage out of range", 400)
+        if tp_pct <= 0 or sl_pct <= 0:
+            return bad("tp_pct and sl_pct must be > 0", 400)
+
+        # === ПУНКТ 1 + ПУНКТ 3: одна позиция + закрытие по противоположному сигналу ===
+        pos_side, pos_size = get_position(symbol)
+
+        if pos_side is not None and pos_size > 0:
+            # Если уже есть позиция в ту же сторону — пропускаем
+            if pos_side == side:
+                return ok("Position already open in same direction -> skip", symbol=symbol, pos_side=pos_side, pos_size=pos_size)
+
+            # Если позиция в противоположную — закрываем и открываем новую
+            close_res = close_position_market(symbol, pos_side, pos_size)
+            time.sleep(0.4)  # дать бирже обновить состояние
+
+            open_res = open_market_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
+            return ok("Closed opposite and opened new with TP/SL", closed=close_res, **open_res)
+
+        # Если позиции нет — просто открываем
+        res = open_market_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
+        return ok("Order placed with TP/SL", **res)
 
     except Exception as e:
         logging.error("WEBHOOK ERROR: %s", str(e))
         logging.error(traceback.format_exc())
-        return jsonify({"ok": False, "error": "internal_error", "hint": "check Render logs"}), 500
-
-    data = request.get_json(silent=True) or {}
-
-    # 1) секрет
-    secret = data.get("secret", "")
-    if not TV_WEBHOOK_SECRET or secret != TV_WEBHOOK_SECRET:
-        return bad("Bad secret", 401)
-
-    # 2) symbol
-    symbol = str(data.get("symbol", DEFAULT_SYMBOL)).upper().strip()
-    if not symbol:
-        return bad("Missing symbol", 400)
-
-    # 3) side (TradingView: BUY/SELL)
-    side_raw = str(data.get("side", "")).lower().strip()
-    if side_raw in ("buy", "long"):
-        side = "Buy"
-    elif side_raw in ("sell", "short"):
-        side = "Sell"
-    else:
-        return bad("Bad side. Use buy/sell", 400, got=side_raw)
-
-    usd = float(data.get("usd", DEFAULT_USD))
-    leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
-
-    # ПУНКТ 2: tp_pct / sl_pct (в процентах)
-    tp_pct = float(data.get("tp_pct", DEFAULT_TP_PCT))
-    sl_pct = float(data.get("sl_pct", DEFAULT_SL_PCT))
-
-    if usd <= 0:
-        return bad("usd must be > 0", 400)
-    if leverage < 1 or leverage > 100:
-        return bad("leverage out of range", 400)
-    if tp_pct <= 0 or sl_pct <= 0:
-        return bad("tp_pct and sl_pct must be > 0", 400)
-
-    try:
-        # === ПУНКТ 1: одна позиция на символ ===
-        open_size = get_open_position_size(symbol)
-        if open_size > 0:
-            return ok("Position already open -> skip", symbol=symbol, open_size=open_size)
-
-        # === ПУНКТ 2: Market + TP/SL ===
-        res = place_market_order_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
-        return ok("Order placed with TP/SL", **res)
-
-    except Exception as e:
-        return bad("Exception", 500, error=str(e), symbol=symbol)
+        return bad("Exception", 500, error=str(e))
 
 
 if __name__ == "__main__":
-    # локально
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
