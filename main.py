@@ -22,8 +22,11 @@ DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "XRPUSDT")
 DEFAULT_USD = float(os.getenv("DEFAULT_USD", "3.5"))
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
-DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))  # %
-DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))  # %
+DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))   # %
+DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))   # %
+
+# ✅ NEW (минимальный апгрейд): TP в импульсе
+DEFAULT_TP_IMPULSE_PCT = float(os.getenv("DEFAULT_TP_IMPULSE_PCT", "1.2"))  # %
 
 # Bybit session (Unified Trading)
 session = HTTP(
@@ -105,7 +108,6 @@ def get_last_price(symbol: str) -> Decimal:
 
 def set_leverage(symbol: str, leverage: int):
     """
-    ВАЖНО: pybit может кидать исключение даже на 110043.
     110043 = leverage not modified (это НЕ ошибка).
     """
     try:
@@ -115,13 +117,11 @@ def set_leverage(symbol: str, leverage: int):
             buyLeverage=str(leverage),
             sellLeverage=str(leverage),
         )
-        # если вернулось нормально:
         if r.get("retCode") not in (0, 110043):
             raise RuntimeError(f"Bybit set_leverage error: {r}")
         return
     except Exception as e:
         msg = str(e)
-        # Игнорируем "не изменилось"
         if ("110043" in msg) or ("leverage not modified" in msg.lower()):
             logging.info("Leverage already set (110043) -> ignore")
             return
@@ -130,7 +130,6 @@ def set_leverage(symbol: str, leverage: int):
 
 def get_open_position_size(symbol: str) -> float:
     """
-    Проверка открытой позиции.
     Возвращает суммарный abs(size) по символу.
     """
     r = session.get_positions(category="linear", symbol=symbol)
@@ -178,7 +177,7 @@ def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: i
     r = session.place_order(
         category="linear",
         symbol=symbol,
-        side=side,               # "Buy" / "Sell"
+        side=side,
         orderType="Market",
         qty=str(qty),
         timeInForce="IOC",
@@ -216,7 +215,7 @@ def health():
 @app.get("/ready")
 def ready():
     """
-    ЧЕК-КОД: проверка готовности (ключи/режим/testnet/доступ к данным Bybit)
+    ЧЕК-КОД готовности
     """
     try:
         missing = []
@@ -228,8 +227,6 @@ def ready():
             missing.append("BYBIT_API_SECRET")
 
         symbol = DEFAULT_SYMBOL
-
-        # Проверим, что Bybit отвечает
         price = get_last_price(symbol)
         qty_step, tick_size = get_instrument_filters(symbol)
 
@@ -241,6 +238,9 @@ def ready():
             "last_price": str(price),
             "qty_step": str(qty_step),
             "tick_size": str(tick_size),
+            "tp_normal_pct": DEFAULT_TP_PCT,
+            "tp_impulse_pct": DEFAULT_TP_IMPULSE_PCT,
+            "sl_pct": DEFAULT_SL_PCT,
         }), 200
 
     except Exception as e:
@@ -259,7 +259,6 @@ def webhook():
         raw = request.get_data(as_text=True)
         logging.info("Webhook raw body: %s", raw)
 
-        # Защита: если не JSON — сразу ошибка
         if not request.is_json:
             return bad("Expected application/json from TradingView", 415, got_content_type=request.content_type)
 
@@ -276,7 +275,7 @@ def webhook():
         if not symbol:
             return bad("Missing symbol", 400)
 
-        # 3) side (STRICT: BUY/SELL or buy/sell/long/short)
+        # 3) side
         side_raw = str(data.get("side", "")).strip()
         side_l = side_raw.lower()
 
@@ -289,7 +288,18 @@ def webhook():
 
         usd = float(data.get("usd", DEFAULT_USD))
         leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
-        tp_pct = float(data.get("tp_pct", DEFAULT_TP_PCT))
+
+        # ✅ NEW: импульсный режим (TradingView может прислать impulse=true)
+        impulse = bool(data.get("impulse", False))
+
+        # TP/SL:
+        # - если impulse=true: tp_pct берем либо из tp_pct_impulse, либо из DEFAULT_TP_IMPULSE_PCT
+        # - иначе как раньше: tp_pct из tp_pct или DEFAULT_TP_PCT
+        if impulse:
+            tp_pct = float(data.get("tp_pct_impulse", DEFAULT_TP_IMPULSE_PCT))
+        else:
+            tp_pct = float(data.get("tp_pct", DEFAULT_TP_PCT))
+
         sl_pct = float(data.get("sl_pct", DEFAULT_SL_PCT))
 
         if usd <= 0:
@@ -299,13 +309,12 @@ def webhook():
         if tp_pct <= 0 or sl_pct <= 0:
             return bad("tp_pct and sl_pct must be > 0", 400)
 
-        # Одна позиция на символ
         open_size = get_open_position_size(symbol)
         if open_size > 0:
-            return ok("Position already open -> skip", symbol=symbol, open_size=open_size)
+            return ok("Position already open -> skip", symbol=symbol, open_size=open_size, impulse=impulse)
 
-        # Открываем Market + TP/SL
         res = place_market_order_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
+        res["impulse"] = impulse
         return ok("Order placed with TP/SL", **res)
 
     except Exception as e:
