@@ -10,45 +10,54 @@ from pybit.unified_trading import HTTP
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# =======================
+# =====================================================
 # ENV
-# =======================
+# =====================================================
 TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
 
-DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "XRPUSDT")
+DEFAULT_SYMBOL = "XRPUSDT"
 DEFAULT_USD = float(os.getenv("DEFAULT_USD", "3.5"))
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
-# === TP / SL ===
-DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))
-DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))
+# === COMMISSION (Bybit taker ≈ 0.1%) ===
+COMMISSION_PCT = Decimal("0.10")
 
-# === NEW FEATURES ===
-DEFAULT_EARLY_SL_PCT = float(os.getenv("DEFAULT_EARLY_SL_PCT", "0.18"))
-DEFAULT_TP1_PCT = float(os.getenv("DEFAULT_TP1_PCT", "0.30"))
-DEFAULT_TP1_QTY = float(os.getenv("DEFAULT_TP1_QTY", "0.5"))
+# === TP / SL базовые ===
+TP_PCT = Decimal("0.55")
+EARLY_SL_PCT = Decimal("0.18")
 
-DEFAULT_BE_OFFSET_PCT = float(os.getenv("DEFAULT_BE_OFFSET_PCT", "0.02"))
-DEFAULT_ATR_LEN = int(os.getenv("DEFAULT_ATR_LEN", "14"))
-DEFAULT_ATR_MULT = float(os.getenv("DEFAULT_ATR_MULT", "1.5"))
+# === TP1 ===
+TP1_PCT = Decimal("0.30")
+TP1_QTY_PCT = Decimal("0.50")
 
-# =======================
+# === BE ===
+BE_OFFSET_PCT = Decimal("0.05")  # перекрывает комиссию
+
+# === ATR trailing ===
+ATR_LEN = 14
+ATR_MULT = Decimal("1.5")
+ATR_TRAIL_DELAY_SEC = 20  # таймер перед включением trailing
+
+# === Spread filter ===
+MAX_SPREAD_PCT = Decimal("0.08")  # защита от плохих входов
+
+# =====================================================
 # BYBIT SESSION
-# =======================
+# =====================================================
 session = HTTP(
     testnet=BYBIT_TESTNET,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
 )
 
-# =======================
+# =====================================================
 # HELPERS
-# =======================
+# =====================================================
 _instrument_cache = {}
-CACHE_TTL = 600
+_position_state = {}  # symbol -> state
 
 
 def now():
@@ -57,7 +66,7 @@ def now():
 
 def get_filters(symbol):
     c = _instrument_cache.get(symbol)
-    if c and now() - c["ts"] < CACHE_TTL:
+    if c and now() - c["ts"] < 600:
         return c["qty"], c["tick"]
 
     r = session.get_instruments_info(category="linear", symbol=symbol)
@@ -69,36 +78,50 @@ def get_filters(symbol):
     return qty, tick
 
 
-def rd(value, step):
-    return (value / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
+def rd(val, step):
+    return (val / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
 
 
-def last_price(symbol):
+def get_ticker(symbol):
     r = session.get_tickers(category="linear", symbol=symbol)
-    return Decimal(r["result"]["list"][0]["lastPrice"])
+    t = r["result"]["list"][0]
+    return Decimal(t["lastPrice"]), Decimal(t["bid1Price"]), Decimal(t["ask1Price"])
+
+
+def spread_ok(symbol):
+    last, bid, ask = get_ticker(symbol)
+    spread_pct = (ask - bid) / last * 100
+    return spread_pct <= MAX_SPREAD_PCT
 
 
 def set_leverage(symbol, lev):
-    session.set_leverage(
-        category="linear",
-        symbol=symbol,
-        buyLeverage=str(lev),
-        sellLeverage=str(lev),
-    )
+    try:
+        session.set_leverage(
+            category="linear",
+            symbol=symbol,
+            buyLeverage=str(lev),
+            sellLeverage=str(lev),
+        )
+    except Exception:
+        pass
 
 
-def open_position(symbol):
+def get_position(symbol):
     r = session.get_positions(category="linear", symbol=symbol)
     for p in r["result"]["list"]:
-        if abs(float(p["size"])) > 0:
-            return True
-    return False
+        if abs(Decimal(p["size"])) > 0:
+            return p
+    return None
 
 
-# =======================
-# ORDER HELPERS
-# =======================
-def market_entry(symbol, side, qty):
+def cancel_all(symbol):
+    session.cancel_all_orders(category="linear", symbol=symbol)
+
+
+# =====================================================
+# ORDER LOGIC
+# =====================================================
+def place_market(symbol, side, qty):
     return session.place_order(
         category="linear",
         symbol=symbol,
@@ -106,96 +129,105 @@ def market_entry(symbol, side, qty):
         orderType="Market",
         qty=str(qty),
         timeInForce="IOC",
-        reduceOnly=False
+        reduceOnly=False,
     )
 
 
-def place_tp(symbol, side, qty, price):
+def place_limit(symbol, side, qty, price):
     return session.place_order(
         category="linear",
         symbol=symbol,
-        side="Sell" if side == "Buy" else "Buy",
+        side=side,
         orderType="Limit",
         qty=str(qty),
         price=str(price),
         timeInForce="GTC",
-        reduceOnly=True
+        reduceOnly=True,
     )
 
 
-def place_sl(symbol, side, qty, price):
+def place_sl(symbol, side, qty, trigger):
     return session.place_order(
         category="linear",
         symbol=symbol,
-        side="Sell" if side == "Buy" else "Buy",
+        side=side,
         orderType="Market",
         qty=str(qty),
-        triggerPrice=str(price),
-        triggerDirection=2 if side == "Buy" else 1,
-        reduceOnly=True
+        triggerPrice=str(trigger),
+        triggerDirection=1 if side == "Sell" else 2,
+        reduceOnly=True,
     )
 
 
-def cancel_all(symbol):
-    session.cancel_all_orders(category="linear", symbol=symbol)
-
-
-# =======================
+# =====================================================
 # WEBHOOK
-# =======================
+# =====================================================
 @app.post("/webhook")
 def webhook():
     try:
         data = request.json
-
         if data.get("secret") != TV_WEBHOOK_SECRET:
-            return jsonify({"ok": False, "msg": "bad secret"}), 401
+            return jsonify({"ok": False}), 401
 
         symbol = data.get("symbol", DEFAULT_SYMBOL)
-        side = "Buy" if data.get("side").lower() in ("buy", "long") else "Sell"
+        side = "Buy" if data["side"].lower() == "buy" else "Sell"
 
-        usd = float(data.get("usd", DEFAULT_USD))
-        lev = int(data.get("leverage", DEFAULT_LEVERAGE))
+        if not spread_ok(symbol):
+            return jsonify({"ok": True, "skip": "bad spread"})
 
-        if open_position(symbol):
-            return jsonify({"ok": True, "msg": "position exists"})
+        pos = get_position(symbol)
 
-        set_leverage(symbol, lev)
+        # === AUTO REVERSE ===
+        if pos:
+            if (pos["side"] == "Buy" and side == "Sell") or (pos["side"] == "Sell" and side == "Buy"):
+                cancel_all(symbol)
+                session.place_order(
+                    category="linear",
+                    symbol=symbol,
+                    side="Sell" if pos["side"] == "Buy" else "Buy",
+                    orderType="Market",
+                    qty=pos["size"],
+                    reduceOnly=True,
+                )
+            else:
+                return jsonify({"ok": True, "skip": "same direction"})
 
-        price = last_price(symbol)
+        set_leverage(symbol, DEFAULT_LEVERAGE)
+
+        last, _, _ = get_ticker(symbol)
         qty_step, tick = get_filters(symbol)
 
-        notional = Decimal(str(usd * lev))
-        qty = rd(notional / price, qty_step)
+        notional = Decimal(DEFAULT_USD * DEFAULT_LEVERAGE)
+        qty = rd(notional / last, qty_step)
 
         # === ENTRY ===
-        market_entry(symbol, side, qty)
+        place_market(symbol, side, qty)
 
-        # === TP1 50% ===
-        tp1_price = price * (Decimal("1") + Decimal(DEFAULT_TP1_PCT)/100) if side == "Buy" \
-            else price * (Decimal("1") - Decimal(DEFAULT_TP1_PCT)/100)
+        entry_price = last
+
+        # === TP1 ===
+        tp1_price = entry_price * (1 + TP1_PCT/100) if side == "Buy" else entry_price * (1 - TP1_PCT/100)
         tp1_price = rd(tp1_price, tick)
+        tp1_qty = rd(qty * TP1_QTY_PCT, qty_step)
 
-        tp1_qty = rd(qty * Decimal(DEFAULT_TP1_QTY), qty_step)
-        rest_qty = qty - tp1_qty
-
-        place_tp(symbol, side, tp1_qty, tp1_price)
+        place_limit(symbol, "Sell" if side == "Buy" else "Buy", tp1_qty, tp1_price)
 
         # === EARLY SL ===
-        early_sl = price * (Decimal("1") - Decimal(DEFAULT_EARLY_SL_PCT)/100) if side == "Buy" \
-            else price * (Decimal("1") + Decimal(DEFAULT_EARLY_SL_PCT)/100)
+        early_sl = entry_price * (1 - EARLY_SL_PCT/100) if side == "Buy" else entry_price * (1 + EARLY_SL_PCT/100)
         early_sl = rd(early_sl, tick)
 
-        place_sl(symbol, side, qty, early_sl)
+        place_sl(symbol, "Sell" if side == "Buy" else "Buy", qty, early_sl)
 
-        return jsonify({
-            "ok": True,
-            "symbol": symbol,
+        # === SAVE STATE ===
+        _position_state[symbol] = {
             "side": side,
-            "qty": str(qty),
-            "tp1_price": str(tp1_price),
-            "early_sl": str(early_sl)
-        })
+            "entry": entry_price,
+            "qty": qty,
+            "tp1_hit": False,
+            "trail_start": now() + ATR_TRAIL_DELAY_SEC,
+        }
+
+        return jsonify({"ok": True})
 
     except Exception as e:
         logging.error(traceback.format_exc())
