@@ -22,43 +22,39 @@ DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "XRPUSDT")
 DEFAULT_USD = float(os.getenv("DEFAULT_USD", "3.5"))
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
-DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.55"))   # %
-DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.35"))   # %
+# БАЗА (если TV не прислал конкретные параметры)
+LONG_TP_PCT = float(os.getenv("LONG_TP_PCT", "0.55"))
+LONG_SL_PCT = float(os.getenv("LONG_SL_PCT", "0.35"))
+SHORT_TP_PCT = float(os.getenv("SHORT_TP_PCT", "0.55"))
+SHORT_SL_PCT = float(os.getenv("SHORT_SL_PCT", "0.35"))
 
-# ✅ NEW (минимальный апгрейд): TP в импульсе
-DEFAULT_TP_IMPULSE_PCT = float(os.getenv("DEFAULT_TP_IMPULSE_PCT", "1.2"))  # %
+# “импульсный TP” отдельно для сторон
+LONG_TP_IMPULSE_PCT = float(os.getenv("LONG_TP_IMPULSE_PCT", "1.2"))
+SHORT_TP_IMPULSE_PCT = float(os.getenv("SHORT_TP_IMPULSE_PCT", "1.2"))
 
-# =======================
-# ✅ ADDED: FEES / FILTERS / TP1 / BE / ATR TRAIL / REVERSE (ENV)
-# =======================
-BYBIT_FEE_PCT = float(os.getenv("BYBIT_FEE_PCT", "0.10"))  # 0.10% per side (taker). total ~0.20%
+# Комиссия / фильтры
+BYBIT_TAKER_FEE_PCT = float(os.getenv("BYBIT_TAKER_FEE_PCT", "0.10"))  # %
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.08"))            # %
 
-COST_FILTER_ENABLED = os.getenv("COST_FILTER_ENABLED", "true").lower() == "true"
-MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.20"))  # tp must be >= fee_total + this
+# TP1 / BE / Trailing (отдельно можно подстроить под “лонг как сейчас” и “шорт как раньше”)
+TP1_QTY_PCT = float(os.getenv("TP1_QTY_PCT", "0.50"))      # 50%
+LONG_TP1_PCT = float(os.getenv("LONG_TP1_PCT", "0.30"))    # %
+SHORT_TP1_PCT = float(os.getenv("SHORT_TP1_PCT", "0.30"))  # %
 
-BAD_ENTRY_FILTER_ENABLED = os.getenv("BAD_ENTRY_FILTER_ENABLED", "true").lower() == "true"
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.06"))  # % (пример: 0.06 = 0.06%)
-MAX_BAR_RANGE_ATR = float(os.getenv("MAX_BAR_RANGE_ATR", "2.5"))  # range <= ATR*X
+LONG_EARLY_SL_PCT = float(os.getenv("LONG_EARLY_SL_PCT", "0.18"))
+SHORT_EARLY_SL_PCT = float(os.getenv("SHORT_EARLY_SL_PCT", "0.18"))
 
-TP1_ENABLED = os.getenv("TP1_ENABLED", "true").lower() == "true"
-TP1_PCT = float(os.getenv("TP1_PCT", "0.50"))  # TP1 distance in %
-TP1_QTY_PCT = float(os.getenv("TP1_QTY_PCT", "0.50"))  # close 50%
-TP1_ORDER_TYPE = os.getenv("TP1_ORDER_TYPE", "Limit")  # Limit recommended
+# BE offset (микро-прибыль, чтобы закрытие не съела комиссия)
+LONG_BE_OFFSET_PCT = float(os.getenv("LONG_BE_OFFSET_PCT", "0.05"))
+SHORT_BE_OFFSET_PCT = float(os.getenv("SHORT_BE_OFFSET_PCT", "0.05"))
 
-BE_ENABLED = os.getenv("BE_ENABLED", "true").lower() == "true"
-BE_ARM_AFTER_TP1 = os.getenv("BE_ARM_AFTER_TP1", "true").lower() == "true"
-BE_OFFSET_PCT = float(os.getenv("BE_OFFSET_PCT", "0.00"))  # move SL to entry +/- offset%
-
-ATR_TRAIL_ENABLED = os.getenv("ATR_TRAIL_ENABLED", "true").lower() == "true"
+# ATR trailing
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-ATR_MULT = float(os.getenv("ATR_MULT", "1.2"))
-ATR_TRAIL_START_PCT = float(os.getenv("ATR_TRAIL_START_PCT", "0.15"))  # start trailing after +0.15%
-ATR_TRAIL_TIMER_BARS = int(os.getenv("ATR_TRAIL_TIMER_BARS", "10"))  # wait N 1m bars before enabling trail updates
-ATR_TF = os.getenv("ATR_TF", "1")  # bybit kline interval: "1"
+LONG_ATR_MULT = float(os.getenv("LONG_ATR_MULT", "1.5"))
+SHORT_ATR_MULT = float(os.getenv("SHORT_ATR_MULT", "1.5"))
+TRAIL_DELAY_SEC = int(os.getenv("TRAIL_DELAY_SEC", "20"))
 
-REVERSE_ENABLED = os.getenv("REVERSE_ENABLED", "true").lower() == "true"
-REVERSE_ONLY_IF_NOT_IN_LOSS = os.getenv("REVERSE_ONLY_IF_NOT_IN_LOSS", "true").lower() == "true"
-REVERSE_MAX_LOSS_PCT = float(os.getenv("REVERSE_MAX_LOSS_PCT", "0.05"))  # do not reverse if unrealized loss > 0.05%
+AUTO_REVERSE = os.getenv("AUTO_REVERSE", "true").lower() == "true"
 
 # Bybit session (Unified Trading)
 session = HTTP(
@@ -71,10 +67,8 @@ session = HTTP(
 _instrument_cache = {}  # symbol -> dict(filters..., ts)
 CACHE_TTL = 60 * 10  # 10 минут
 
-# =======================
-# ✅ ADDED: in-memory trade state (for TP1/BE/ATR trailing)
-# =======================
-_trade_state = {}  # symbol -> dict(state)
+# Состояние менеджера позиций (TP1->BE->Trailing)
+_position_state = {}  # symbol -> dict(state)
 
 
 def ok(msg, **extra):
@@ -133,19 +127,6 @@ def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
 
 
-def get_last_price(symbol: str) -> Decimal:
-    r = session.get_tickers(category="linear", symbol=symbol)
-    if r.get("retCode") != 0:
-        raise RuntimeError(f"Bybit get_tickers error: {r}")
-    lst = (r.get("result") or {}).get("list") or []
-    if not lst:
-        raise RuntimeError("No ticker data")
-    return Decimal(str(lst[0].get("lastPrice")))
-
-
-# =======================
-# ✅ ADDED: bid/ask spread + impulse checks
-# =======================
 def get_bid_ask(symbol: str):
     r = session.get_tickers(category="linear", symbol=symbol)
     if r.get("retCode") != 0:
@@ -153,49 +134,11 @@ def get_bid_ask(symbol: str):
     lst = (r.get("result") or {}).get("list") or []
     if not lst:
         raise RuntimeError("No ticker data")
-    t = lst[0]
-    bid = Decimal(str(t.get("bid1Price") or "0"))
-    ask = Decimal(str(t.get("ask1Price") or "0"))
-    last = Decimal(str(t.get("lastPrice") or "0"))
-    return bid, ask, last
-
-
-def get_klines(symbol: str, interval: str, limit: int = 200):
-    r = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
-    if r.get("retCode") != 0:
-        raise RuntimeError(f"Bybit get_kline error: {r}")
-    return (r.get("result") or {}).get("list") or []
-
-
-def calc_atr_from_klines(klines, length: int) -> Decimal:
-    """
-    klines item format (Bybit): [startTime, open, high, low, close, volume, turnover]
-    Returned list is usually reverse-chronological; we normalize.
-    """
-    if not klines or len(klines) < length + 2:
-        return Decimal("0")
-
-    # normalize to chronological
-    k = list(reversed(klines))
-    highs = [Decimal(str(x[2])) for x in k]
-    lows = [Decimal(str(x[3])) for x in k]
-    closes = [Decimal(str(x[4])) for x in k]
-
-    trs = []
-    for i in range(1, len(k)):
-        h = highs[i]
-        l = lows[i]
-        pc = closes[i - 1]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-
-    if len(trs) < length:
-        return Decimal("0")
-
-    # simple ATR (SMA of TR)
-    window = trs[-length:]
-    atr = sum(window) / Decimal(str(length))
-    return atr
+    item = lst[0]
+    last = Decimal(str(item.get("lastPrice")))
+    bid = Decimal(str(item.get("bid1Price") or item.get("lastPrice")))
+    ask = Decimal(str(item.get("ask1Price") or item.get("lastPrice")))
+    return last, bid, ask
 
 
 def set_leverage(symbol: str, leverage: int):
@@ -211,7 +154,6 @@ def set_leverage(symbol: str, leverage: int):
         )
         if r.get("retCode") not in (0, 110043):
             raise RuntimeError(f"Bybit set_leverage error: {r}")
-        return
     except Exception as e:
         msg = str(e)
         if ("110043" in msg) or ("leverage not modified" in msg.lower()):
@@ -220,113 +162,135 @@ def set_leverage(symbol: str, leverage: int):
         raise
 
 
-def get_open_position_size(symbol: str) -> float:
+def get_position(symbol: str):
     """
-    Возвращает суммарный abs(size) по символу.
+    Возвращает позицию или None.
     """
     r = session.get_positions(category="linear", symbol=symbol)
     if r.get("retCode") != 0:
         raise RuntimeError(f"Bybit get_positions error: {r}")
 
     pos_list = (r.get("result") or {}).get("list") or []
-    total = 0.0
-    for p in pos_list:
-        total += abs(float(p.get("size") or 0))
-    return total
-
-
-# =======================
-# ✅ ADDED: get position direction + entry price + unrealized PnL%
-# =======================
-def get_position_info(symbol: str):
-    r = session.get_positions(category="linear", symbol=symbol)
-    if r.get("retCode") != 0:
-        raise RuntimeError(f"Bybit get_positions error: {r}")
-
-    pos_list = (r.get("result") or {}).get("list") or []
-    # Bybit returns long/short entries; we choose the one with size>0
     for p in pos_list:
         size = Decimal(str(p.get("size") or "0"))
-        if size > 0:
-            side = str(p.get("side") or "")
-            entry = Decimal(str(p.get("avgPrice") or "0"))
-            mark = Decimal(str(p.get("markPrice") or "0"))
-            upnl = Decimal(str(p.get("unrealisedPnl") or "0"))
-            value = Decimal(str(p.get("positionValue") or "0"))
-            pnl_pct = Decimal("0")
-            if value > 0:
-                pnl_pct = (upnl / value) * Decimal("100")
+        if abs(size) > 0:
             return {
-                "side": side,         # "Buy" or "Sell" in our mapping sense; Bybit side might be "Buy"/"Sell"
+                "side": str(p.get("side") or ""),      # "Buy"/"Sell"
                 "size": size,
-                "entry": entry,
-                "mark": mark,
-                "upnl": upnl,
-                "pnl_pct": pnl_pct
+                "avgPrice": Decimal(str(p.get("avgPrice") or "0")),
             }
     return None
 
 
-def calc_tp_sl_prices(entry_price: Decimal, side: str, tp_pct: float, sl_pct: float, tick_size: Decimal):
-    tp_p = Decimal(str(tp_pct)) / Decimal("100")
-    sl_p = Decimal(str(sl_pct)) / Decimal("100")
-
-    if side == "Buy":
-        tp = entry_price * (Decimal("1") + tp_p)
-        sl = entry_price * (Decimal("1") - sl_p)
-    else:
-        tp = entry_price * (Decimal("1") - tp_p)
-        sl = entry_price * (Decimal("1") + sl_p)
-
-    tp = round_down_to_step(tp, tick_size)
-    sl = round_down_to_step(sl, tick_size)
-    return tp, sl
+def cancel_all_orders(symbol: str):
+    session.cancel_all_orders(category="linear", symbol=symbol)
 
 
-# =======================
-# ✅ ADDED: TP1 price calc + order placement + SL update
-# =======================
-def calc_tp1_price(entry_price: Decimal, side: str, tp1_pct: float, tick_size: Decimal):
-    p = Decimal(str(tp1_pct)) / Decimal("100")
-    if side == "Buy":
-        tp1 = entry_price * (Decimal("1") + p)
-    else:
-        tp1 = entry_price * (Decimal("1") - p)
-    return round_down_to_step(tp1, tick_size)
-
-
-def place_reduce_only_tp1(symbol: str, side: str, qty: Decimal, tp1_price: Decimal):
+def set_trading_stop(symbol: str, tp_price: Decimal | None, sl_price: Decimal | None, trailing_dist: Decimal | None = None):
     """
-    side is position side "Buy"/"Sell". For reduce-only TP, we must send opposite side.
+    Управление стопами на позиции (SL/TP/Trailing) — надежнее, чем пытаться “склеить” в place_order.
+    trailing_dist = абсолютная дистанция в цене.
     """
-    close_side = "Sell" if side == "Buy" else "Buy"
-    r = session.place_order(
-        category="linear",
-        symbol=symbol,
-        side=close_side,
-        orderType=TP1_ORDER_TYPE,
-        qty=str(qty),
-        price=str(tp1_price) if TP1_ORDER_TYPE.lower() == "limit" else None,
-        timeInForce="GTC" if TP1_ORDER_TYPE.lower() == "limit" else "IOC",
-        reduceOnly=True,
-    )
-    if r.get("retCode") != 0:
-        raise RuntimeError(f"Bybit TP1 place_order error: {r}")
-    return r
+    args = {
+        "category": "linear",
+        "symbol": symbol,
+        "tpslMode": "Full",
+    }
+    if tp_price is not None:
+        args["takeProfit"] = str(tp_price)
+    if sl_price is not None:
+        args["stopLoss"] = str(sl_price)
+    if trailing_dist is not None and trailing_dist > 0:
+        args["trailingStop"] = str(trailing_dist)
 
-
-def set_position_sl(symbol: str, new_sl: Decimal):
-    r = session.set_trading_stop(
-        category="linear",
-        symbol=symbol,
-        stopLoss=str(new_sl),
-    )
+    r = session.set_trading_stop(**args)
     if r.get("retCode") != 0:
         raise RuntimeError(f"Bybit set_trading_stop error: {r}")
     return r
 
 
+def price_by_pct(entry_price: Decimal, side: str, pct: float, tick_size: Decimal, direction: str):
+    """
+    direction:
+      - "tp": в сторону прибыли
+      - "sl": в сторону убытка
+    """
+    p = Decimal(str(pct)) / Decimal("100")
+    if side == "Buy":
+        price = entry_price * (Decimal("1") + p) if direction == "tp" else entry_price * (Decimal("1") - p)
+    else:
+        price = entry_price * (Decimal("1") - p) if direction == "tp" else entry_price * (Decimal("1") + p)
+    return round_down_to_step(price, tick_size)
+
+
+def compute_atr_distance(symbol: str, tick_size: Decimal, atr_len: int, atr_mult: float) -> Decimal:
+    """
+    ATR Wilder по 1m kline (Bybit).
+    Возвращает trailing дистанцию (в цене).
+    """
+    try:
+        r = session.get_kline(category="linear", symbol=symbol, interval="1", limit=atr_len + 2)
+        if r.get("retCode") != 0:
+            raise RuntimeError(f"Bybit get_kline error: {r}")
+        kl = (r.get("result") or {}).get("list") or []
+        if len(kl) < atr_len:
+            return tick_size
+
+        highs, lows, closes = [], [], []
+        for row in reversed(kl):
+            highs.append(Decimal(str(row[2])))
+            lows.append(Decimal(str(row[3])))
+            closes.append(Decimal(str(row[4])))
+
+        trs = []
+        for i in range(1, len(closes)):
+            high = highs[i]
+            low = lows[i]
+            prev_close = closes[i - 1]
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+
+        if not trs:
+            return tick_size
+
+        # Wilder smoothing
+        atr = trs[0]
+        for tr in trs[1:]:
+            atr = (atr * Decimal(str(atr_len - 1)) + tr) / Decimal(str(atr_len))
+
+        dist = atr * Decimal(str(atr_mult))
+        dist = round_down_to_step(dist, tick_size)
+        return dist if dist > 0 else tick_size
+    except Exception as e:
+        logging.info("ATR calc fallback: %s", str(e))
+        return tick_size
+
+
+def place_tp1_reduce_only(symbol: str, pos_side: str, qty: Decimal, price: Decimal):
+    """
+    TP1 лимиткой reduceOnly.
+    pos_side = "Buy"/"Sell" (сторона позиции)
+    """
+    close_side = "Sell" if pos_side == "Buy" else "Buy"
+    r = session.place_order(
+        category="linear",
+        symbol=symbol,
+        side=close_side,
+        orderType="Limit",
+        qty=str(qty),
+        price=str(price),
+        timeInForce="GTC",
+        reduceOnly=True,
+    )
+    if r.get("retCode") != 0:
+        raise RuntimeError(f"Bybit TP1 reduceOnly error: {r}")
+    return r
+
+
 def close_position_market(symbol: str, pos_side: str, qty: Decimal):
+    """
+    Закрыть позицию по рынку reduceOnly.
+    """
     close_side = "Sell" if pos_side == "Buy" else "Buy"
     r = session.place_order(
         category="linear",
@@ -342,62 +306,141 @@ def close_position_market(symbol: str, pos_side: str, qty: Decimal):
     return r
 
 
-def passes_cost_filter(tp_pct: float) -> bool:
-    if not COST_FILTER_ENABLED:
-        return True
-    fee_total = BYBIT_FEE_PCT * 2.0
-    # require tp >= fee_total + min_edge
-    return tp_pct >= (fee_total + MIN_EDGE_PCT)
+def manage_after_entry(symbol: str, side: str, entry_price: Decimal, qty: Decimal, tick_size: Decimal, qty_step: Decimal, impulse: bool):
+    """
+    Ставим:
+      - TP1 reduceOnly (50%)
+      - Early SL (на всю позицию)
+      - базовый TP/SL можно оставить через set_trading_stop (если хочешь)
+      - записываем state для BE + trailing
+    """
+    if side == "Buy":
+        tp1_pct = LONG_TP1_PCT
+        early_sl_pct = LONG_EARLY_SL_PCT
+        be_offset = LONG_BE_OFFSET_PCT
+        atr_mult = LONG_ATR_MULT
+    else:
+        tp1_pct = SHORT_TP1_PCT
+        early_sl_pct = SHORT_EARLY_SL_PCT
+        be_offset = SHORT_BE_OFFSET_PCT
+        atr_mult = SHORT_ATR_MULT
+
+    tp1_price = price_by_pct(entry_price, side, tp1_pct, tick_size, "tp")
+    early_sl = price_by_pct(entry_price, side, early_sl_pct, tick_size, "sl")
+
+    tp1_qty = round_down_to_step(qty * Decimal(str(TP1_QTY_PCT)), qty_step)
+    if tp1_qty <= 0:
+        tp1_qty = qty
+
+    # TP1 reduceOnly
+    place_tp1_reduce_only(symbol, side, tp1_qty, tp1_price)
+
+    # Early SL на всю позицию
+    set_trading_stop(symbol, tp_price=None, sl_price=early_sl, trailing_dist=None)
+
+    _position_state[symbol] = {
+        "side": side,
+        "entry": str(entry_price),
+        "qty": str(qty),
+        "tp1_qty": str(tp1_qty),
+        "tp1_price": str(tp1_price),
+        "tp1_hit": False,
+        "be_set": False,
+        "trail_enabled": False,
+        "trail_enable_at": _now() + int(TRAIL_DELAY_SEC),
+        "atr_mult": str(atr_mult),
+        "be_offset": str(be_offset),
+        "impulse": bool(impulse),
+        "last_ts": _now(),
+    }
+
+    return {
+        "tp1_price": str(tp1_price),
+        "tp1_qty": str(tp1_qty),
+        "early_sl": str(early_sl),
+        "trail_enable_at": int(_position_state[symbol]["trail_enable_at"]),
+    }
 
 
-def passes_bad_entry_filters(symbol: str) -> (bool, dict):
-    info = {}
-    if not BAD_ENTRY_FILTER_ENABLED:
-        return True, info
+def update_position_manager(symbol: str):
+    """
+    Вызывается при каждом webhook.
+    Делает:
+      - detect TP1 by size shrink
+      - SL -> BE
+      - trailing after delay and after TP1
+    """
+    st = _position_state.get(symbol)
+    if not st:
+        return
 
-    bid, ask, last = get_bid_ask(symbol)
-    if bid <= 0 or ask <= 0 or last <= 0:
-        return True, {"note": "no bid/ask -> skip filter"}
+    pos = get_position(symbol)
+    if not pos:
+        _position_state.pop(symbol, None)
+        return
 
-    mid = (bid + ask) / Decimal("2")
-    spread_pct = (ask - bid) / mid * Decimal("100")
-    info["spread_pct"] = float(spread_pct)
+    side = st["side"]
+    entry = Decimal(st["entry"])
+    qty_initial = Decimal(st["qty"])
+    tp1_qty = Decimal(st["tp1_qty"])
 
-    if float(spread_pct) > MAX_SPREAD_PCT:
-        return False, info
-
-    # impulse filter: last 1m candle range vs ATR
-    kl = get_klines(symbol, ATR_TF, limit=max(ATR_LEN + 50, 80))
-    atr = calc_atr_from_klines(kl, ATR_LEN)
-    info["atr"] = float(atr)
-
-    if atr > 0 and kl:
-        last_k = kl[0]  # most recent
-        hi = Decimal(str(last_k[2]))
-        lo = Decimal(str(last_k[3]))
-        rng = hi - lo
-        info["last_range"] = float(rng)
-
-        if rng > atr * Decimal(str(MAX_BAR_RANGE_ATR)):
-            return False, info
-
-    return True, info
-
-
-def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: int, tp_pct: float, sl_pct: float):
-    set_leverage(symbol, leverage)
-
-    price = get_last_price(symbol)
     qty_step, tick_size = get_instrument_filters(symbol)
+    size_now = abs(pos["size"])
 
+    # TP1 “считаем исполненным”, если размер уменьшился примерно на TP1
+    if (not st["tp1_hit"]) and (size_now <= (qty_initial - (tp1_qty * Decimal("0.90")))):
+        st["tp1_hit"] = True
+        logging.info("TP1 assumed hit for %s (size_now=%s)", symbol, str(size_now))
+
+        # Убираем старые лимитки/мусор
+        cancel_all_orders(symbol)
+
+        # BE = entry + offset + fee_buffer (в сторону прибыли)
+        be_offset = Decimal(st["be_offset"]) / Decimal("100")
+        fee_buffer = Decimal(str(BYBIT_TAKER_FEE_PCT)) / Decimal("100") / Decimal("100")  # 0.10% -> 0.0010
+        total_pct = (be_offset + fee_buffer) * Decimal("100")  # обратно в %
+
+        be_price = price_by_pct(entry, side, float(total_pct), tick_size, "tp")
+        set_trading_stop(symbol, tp_price=None, sl_price=be_price, trailing_dist=None)
+        st["be_set"] = True
+
+    # trailing только после TP1 и после таймера
+    if st["tp1_hit"] and (not st["trail_enabled"]) and (_now() >= int(st["trail_enable_at"])):
+        atr_mult = float(st["atr_mult"])
+        dist = compute_atr_distance(symbol, tick_size, ATR_LEN, atr_mult)
+        set_trading_stop(symbol, tp_price=None, sl_price=None, trailing_dist=dist)
+        st["trail_enabled"] = True
+        logging.info("ATR trailing enabled for %s dist=%s", symbol, str(dist))
+
+    st["last_ts"] = _now()
+    _position_state[symbol] = st
+
+
+def calc_qty_from_usd(symbol: str, usd: float, leverage: int, price: Decimal) -> Decimal:
+    qty_step, _ = get_instrument_filters(symbol)
     notional = Decimal(str(usd)) * Decimal(str(leverage))
     raw_qty = notional / price
     qty = round_down_to_step(raw_qty, qty_step)
+    return qty
 
+
+def place_entry(symbol: str, side: str, usd: float, leverage: int, impulse: bool):
+    """
+    Вход + менеджер TP1/BE/trailing.
+    """
+    set_leverage(symbol, leverage)
+
+    last, bid, ask = get_bid_ask(symbol)
+    spread_pct = (ask - bid) / last * Decimal("100")
+    if spread_pct > Decimal(str(MAX_SPREAD_PCT)):
+        raise RuntimeError(f"Spread too high: {spread_pct:.4f}% > {MAX_SPREAD_PCT}%")
+
+    price = last
+    qty_step, tick_size = get_instrument_filters(symbol)
+
+    qty = calc_qty_from_usd(symbol, usd, leverage, price)
     if qty <= 0:
-        raise RuntimeError(f"Bad qty computed: raw={raw_qty}, step={qty_step}, qty={qty}")
-
-    tp_price, sl_price = calc_tp_sl_prices(price, side, tp_pct, sl_pct, tick_size)
+        raise RuntimeError("Bad qty computed")
 
     r = session.place_order(
         category="linear",
@@ -407,139 +450,21 @@ def place_market_order_with_tpsl(symbol: str, side: str, usd: float, leverage: i
         qty=str(qty),
         timeInForce="IOC",
         reduceOnly=False,
-        takeProfit=str(tp_price),
-        stopLoss=str(sl_price),
     )
-
     if r.get("retCode") != 0:
         raise RuntimeError(f"Bybit place_order error: {r}")
+
+    mgr = manage_after_entry(symbol, side, price, qty, tick_size, qty_step, impulse)
 
     return {
         "symbol": symbol,
         "side": side,
         "entry_price_used": str(price),
         "qty": str(qty),
-        "tp_price": str(tp_price),
-        "sl_price": str(sl_price),
-        "tp_pct": tp_pct,
-        "sl_pct": sl_pct,
+        "spread_pct": str(spread_pct),
+        "tp1": mgr,
         "raw": r,
     }
-
-
-# =======================
-# ✅ ADDED: background manager (TP1 fill -> BE, ATR trailing updates)
-# =======================
-def ensure_trade_manager_running():
-    # one lightweight thread, started lazily
-    if getattr(ensure_trade_manager_running, "_started", False):
-        return
-    ensure_trade_manager_running._started = True
-
-    import threading
-
-    def loop():
-        while True:
-            try:
-                for symbol in list(_trade_state.keys()):
-                    st = _trade_state.get(symbol) or {}
-                    if not st.get("active"):
-                        continue
-
-                    pos = get_position_info(symbol)
-                    if not pos:
-                        # position closed
-                        st["active"] = False
-                        _trade_state[symbol] = st
-                        continue
-
-                    qty_step, tick_size = get_instrument_filters(symbol)
-
-                    # ---- TP1 filled? (we mark TP1 as "armed"; if position size <= initial*(1-TP1_QTY_PCT/2) we assume TP1 got some fill)
-                    initial_qty = Decimal(str(st.get("initial_qty") or "0"))
-                    cur_qty = pos["size"]
-
-                    if TP1_ENABLED and st.get("tp1_placed") and (not st.get("tp1_done")):
-                        # crude but robust: if size reduced by ~TP1_QTY_PCT, we consider TP1 done
-                        target_remain = initial_qty * (Decimal("1") - Decimal(str(TP1_QTY_PCT)) * Decimal("0.8"))
-                        if cur_qty <= target_remain:
-                            st["tp1_done"] = True
-                            st["tp1_done_ts"] = _now()
-                            _trade_state[symbol] = st
-                            logging.info("TP1 likely filled -> arm BE/Trail for %s", symbol)
-
-                    # ---- BE after TP1
-                    if BE_ENABLED and BE_ARM_AFTER_TP1 and st.get("tp1_done") and (not st.get("be_done")):
-                        entry = pos["entry"]
-                        offset = Decimal(str(BE_OFFSET_PCT)) / Decimal("100")
-                        if pos["side"] == "Buy":
-                            be_sl = entry * (Decimal("1") + offset)
-                        else:
-                            be_sl = entry * (Decimal("1") - offset)
-                        be_sl = round_down_to_step(be_sl, tick_size)
-
-                        set_position_sl(symbol, be_sl)
-                        st["be_done"] = True
-                        st["last_sl"] = str(be_sl)
-                        _trade_state[symbol] = st
-                        logging.info("BE set for %s -> %s", symbol, be_sl)
-
-                    # ---- ATR trailing (after timer + after price moved in favor)
-                    if ATR_TRAIL_ENABLED:
-                        entry_ts = int(st.get("entry_ts") or 0)
-                        if entry_ts > 0:
-                            minutes_in_trade = max(0, (_now() - entry_ts) // 60)
-                        else:
-                            minutes_in_trade = 0
-
-                        # timer gate
-                        if minutes_in_trade >= ATR_TRAIL_TIMER_BARS:
-                            # start gate by profit %
-                            mark = pos["mark"]
-                            entry = pos["entry"]
-                            if entry > 0:
-                                if pos["side"] == "Buy":
-                                    move_pct = (mark - entry) / entry * Decimal("100")
-                                else:
-                                    move_pct = (entry - mark) / entry * Decimal("100")
-                            else:
-                                move_pct = Decimal("0")
-
-                            if move_pct >= Decimal(str(ATR_TRAIL_START_PCT)):
-                                kl = get_klines(symbol, ATR_TF, limit=max(ATR_LEN + 50, 80))
-                                atr = calc_atr_from_klines(kl, ATR_LEN)
-                                if atr > 0:
-                                    if pos["side"] == "Buy":
-                                        new_sl = mark - atr * Decimal(str(ATR_MULT))
-                                    else:
-                                        new_sl = mark + atr * Decimal(str(ATR_MULT))
-                                    new_sl = round_down_to_step(new_sl, tick_size)
-
-                                    # only tighten (never loosen)
-                                    last_sl = Decimal(str(st.get("last_sl") or "0"))
-                                    if last_sl <= 0:
-                                        # if we don't know last SL, just set
-                                        set_position_sl(symbol, new_sl)
-                                        st["last_sl"] = str(new_sl)
-                                        _trade_state[symbol] = st
-                                    else:
-                                        if pos["side"] == "Buy" and new_sl > last_sl:
-                                            set_position_sl(symbol, new_sl)
-                                            st["last_sl"] = str(new_sl)
-                                            _trade_state[symbol] = st
-                                        if pos["side"] == "Sell" and new_sl < last_sl:
-                                            set_position_sl(symbol, new_sl)
-                                            st["last_sl"] = str(new_sl)
-                                            _trade_state[symbol] = st
-
-            except Exception as e:
-                logging.error("TRADE MANAGER ERROR: %s", str(e))
-                logging.error(traceback.format_exc())
-
-            time.sleep(5)  # light polling
-
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
 
 
 @app.get("/")
@@ -554,9 +479,6 @@ def health():
 
 @app.get("/ready")
 def ready():
-    """
-    ЧЕК-КОД готовности
-    """
     try:
         missing = []
         if not TV_WEBHOOK_SECRET:
@@ -567,7 +489,6 @@ def ready():
             missing.append("BYBIT_API_SECRET")
 
         symbol = DEFAULT_SYMBOL
-        price = get_last_price(symbol)
         qty_step, tick_size = get_instrument_filters(symbol)
 
         return jsonify({
@@ -575,176 +496,113 @@ def ready():
             "mode": "TESTNET" if BYBIT_TESTNET else "REAL",
             "missing_env": missing,
             "default_symbol": symbol,
-            "last_price": str(price),
             "qty_step": str(qty_step),
             "tick_size": str(tick_size),
-            "tp_normal_pct": DEFAULT_TP_PCT,
-            "tp_impulse_pct": DEFAULT_TP_IMPULSE_PCT,
-            "sl_pct": DEFAULT_SL_PCT,
-            # ✅ ADDED: show extra config
-            "fee_pct": BYBIT_FEE_PCT,
-            "tp1_enabled": TP1_ENABLED,
-            "tp1_pct": TP1_PCT,
+            "max_spread_pct": MAX_SPREAD_PCT,
+            "fee_pct": BYBIT_TAKER_FEE_PCT,
             "tp1_qty_pct": TP1_QTY_PCT,
-            "be_enabled": BE_ENABLED,
-            "atr_trail_enabled": ATR_TRAIL_ENABLED,
-            "reverse_enabled": REVERSE_ENABLED,
-            "filters_enabled": BAD_ENTRY_FILTER_ENABLED,
+            "trail_delay_sec": TRAIL_DELAY_SEC,
+            "atr_len": ATR_LEN,
+            "auto_reverse": AUTO_REVERSE,
+            "long": {
+                "tp_pct": LONG_TP_PCT,
+                "sl_pct": LONG_SL_PCT,
+                "tp1_pct": LONG_TP1_PCT,
+                "early_sl_pct": LONG_EARLY_SL_PCT,
+                "be_offset_pct": LONG_BE_OFFSET_PCT,
+                "atr_mult": LONG_ATR_MULT,
+                "tp_impulse_pct": LONG_TP_IMPULSE_PCT,
+            },
+            "short": {
+                "tp_pct": SHORT_TP_PCT,
+                "sl_pct": SHORT_SL_PCT,
+                "tp1_pct": SHORT_TP1_PCT,
+                "early_sl_pct": SHORT_EARLY_SL_PCT,
+                "be_offset_pct": SHORT_BE_OFFSET_PCT,
+                "atr_mult": SHORT_ATR_MULT,
+                "tp_impulse_pct": SHORT_TP_IMPULSE_PCT,
+            }
         }), 200
-
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "mode": "TESTNET" if BYBIT_TESTNET else "REAL",
-            "error": str(e),
-            "hint": "Check Render logs and verify keys/permissions/symbol"
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.post("/webhook")
 def webhook():
     try:
-        logging.info("Webhook headers: %s", dict(request.headers))
-        raw = request.get_data(as_text=True)
-        logging.info("Webhook raw body: %s", raw)
-
         if not request.is_json:
-            return bad("Expected application/json from TradingView", 415, got_content_type=request.content_type)
+            return bad("Expected application/json", 415, got_content_type=request.content_type)
 
         data = request.get_json(silent=True) or {}
         logging.info("Webhook json: %s", data)
 
-        # 1) secret
+        # secret
         secret = str(data.get("secret", ""))
         if (not TV_WEBHOOK_SECRET) or (secret != TV_WEBHOOK_SECRET):
             return bad("Bad secret", 401)
 
-        # 2) symbol
         symbol = str(data.get("symbol", DEFAULT_SYMBOL)).upper().strip()
         if not symbol:
             return bad("Missing symbol", 400)
 
-        # 3) side
-        side_raw = str(data.get("side", "")).strip()
-        side_l = side_raw.lower()
+        # обновляем менеджер позиции на каждом webhook
+        try:
+            update_position_manager(symbol)
+        except Exception as e:
+            logging.info("update_position_manager skipped: %s", str(e))
 
-        if side_l in ("buy", "long"):
+        side_raw = str(data.get("side", "")).strip().lower()
+        if side_raw in ("buy", "long"):
             side = "Buy"
-        elif side_l in ("sell", "short"):
+        elif side_raw in ("sell", "short"):
             side = "Sell"
         else:
             return bad("Bad side. Use BUY/SELL", 400, got=side_raw)
 
         usd = float(data.get("usd", DEFAULT_USD))
         leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
-
-        # ✅ NEW: импульсный режим (TradingView может прислать impulse=true)
         impulse = bool(data.get("impulse", False))
-
-        # TP/SL:
-        # - если impulse=true: tp_pct берем либо из tp_pct_impulse, либо из DEFAULT_TP_IMPULSE_PCT
-        # - иначе как раньше: tp_pct из tp_pct или DEFAULT_TP_PCT
-        if impulse:
-            tp_pct = float(data.get("tp_pct_impulse", DEFAULT_TP_IMPULSE_PCT))
-        else:
-            tp_pct = float(data.get("tp_pct", DEFAULT_TP_PCT))
-
-        sl_pct = float(data.get("sl_pct", DEFAULT_SL_PCT))
 
         if usd <= 0:
             return bad("usd must be > 0", 400)
         if leverage < 1 or leverage > 100:
             return bad("leverage out of range", 400)
-        if tp_pct <= 0 or sl_pct <= 0:
-            return bad("tp_pct and sl_pct must be > 0", 400)
 
-        # =======================
-        # ✅ ADDED: cost filter (avoid commission-only trades)
-        # =======================
-        if not passes_cost_filter(tp_pct):
-            return ok("Skip: cost filter (tp too small vs fees)", symbol=symbol, tp_pct=tp_pct, fee_total_pct=BYBIT_FEE_PCT * 2, min_edge_pct=MIN_EDGE_PCT)
-
-        # =======================
-        # ✅ ADDED: spread/impulse filter
-        # =======================
-        ok_entry, info = passes_bad_entry_filters(symbol)
-        if not ok_entry:
-            return ok("Skip: bad entry filter (spread/impulse)", symbol=symbol, details=info)
-
-        # =======================
-        # ✅ ADDED: reverse logic
-        # =======================
-        pos = get_position_info(symbol)
-        if pos and REVERSE_ENABLED:
-            # if opposite signal:
-            current_side = pos["side"]  # "Buy" or "Sell" in our dict
-            if (current_side == "Buy" and side == "Sell") or (current_side == "Sell" and side == "Buy"):
-                # optional: don't reverse if deep in loss
-                if REVERSE_ONLY_IF_NOT_IN_LOSS:
-                    if pos["pnl_pct"] < -Decimal(str(REVERSE_MAX_LOSS_PCT)):
-                        return ok("Skip reverse: position in loss beyond limit", symbol=symbol, pnl_pct=float(pos["pnl_pct"]), limit=-REVERSE_MAX_LOSS_PCT)
-
-                # close full and open opposite
-                close_position_market(symbol, current_side, pos["size"])
-                time.sleep(0.5)  # small delay
-                # after close, continue to place new
-            else:
-                return ok("Position already open same direction -> skip", symbol=symbol, open_size=float(pos["size"]), impulse=impulse)
-
+        # Если TV прислал конкретные параметры — используем их, иначе берём по стороне из ENV.
+        # (это ключ к “лонг как сейчас” + “шорт как раньше”)
+        if side == "Buy":
+            default_tp = LONG_TP_IMPULSE_PCT if impulse else LONG_TP_PCT
+            default_sl = LONG_SL_PCT
         else:
-            open_size = get_open_position_size(symbol)
-            if open_size > 0:
-                return ok("Position already open -> skip", symbol=symbol, open_size=open_size, impulse=impulse)
+            default_tp = SHORT_TP_IMPULSE_PCT if impulse else SHORT_TP_PCT
+            default_sl = SHORT_SL_PCT
 
-        # =======================
-        # Place market + position TP/SL (as before)
-        # =======================
-        res = place_market_order_with_tpsl(symbol, side, usd, leverage, tp_pct, sl_pct)
+        tp_pct = float(data.get("tp_pct", default_tp))
+        sl_pct = float(data.get("sl_pct", default_sl))
+
+        # Позиция есть?
+        pos = get_position(symbol)
+        if pos:
+            pos_side = pos["side"]
+
+            # авто-reverse
+            if AUTO_REVERSE and ((pos_side == "Buy" and side == "Sell") or (pos_side == "Sell" and side == "Buy")):
+                logging.info("AUTO_REVERSE: closing %s and opening %s", pos_side, side)
+                cancel_all_orders(symbol)
+                close_position_market(symbol, pos_side, abs(pos["size"]))
+                _position_state.pop(symbol, None)
+                res = place_entry(symbol, side, usd, leverage, impulse)
+                return ok("Reversed: closed old & opened new", **res)
+
+            # иначе просто пропускаем
+            return ok("Position already open -> skip", symbol=symbol, pos_side=pos_side, size=str(pos["size"]))
+
+        # НОВЫЙ ВХОД
+        res = place_entry(symbol, side, usd, leverage, impulse)
+        res["tp_pct_used_for_info"] = tp_pct
+        res["sl_pct_used_for_info"] = sl_pct
         res["impulse"] = impulse
-
-        # =======================
-        # ✅ ADDED: place TP1 reduceOnly on exchange
-        # =======================
-        qty_step, tick_size = get_instrument_filters(symbol)
-        entry_price = Decimal(str(res["entry_price_used"]))
-        total_qty = Decimal(str(res["qty"]))
-
-        tp1_price = None
-        tp1_qty = None
-        tp1_raw = None
-
-        if TP1_ENABLED:
-            tp1_price = calc_tp1_price(entry_price, side, TP1_PCT, tick_size)
-            tp1_qty_raw = total_qty * Decimal(str(TP1_QTY_PCT))
-            tp1_qty = round_down_to_step(tp1_qty_raw, qty_step)
-
-            # safety: must be >= step
-            if tp1_qty > 0:
-                tp1_raw = place_reduce_only_tp1(symbol, side, tp1_qty, tp1_price)
-
-        # =======================
-        # ✅ ADDED: register state for BE/ATR trailing manager
-        # =======================
-        _trade_state[symbol] = {
-            "active": True,
-            "entry_ts": _now(),
-            "entry_price": str(entry_price),
-            "side": side,
-            "initial_qty": str(total_qty),
-            "tp1_placed": bool(tp1_raw is not None),
-            "tp1_done": False,
-            "be_done": False,
-            "last_sl": str(res["sl_price"]),  # start with initial SL
-        }
-        ensure_trade_manager_running()
-
-        # enrich response
-        if tp1_price is not None:
-            res["tp1_price"] = str(tp1_price)
-        if tp1_qty is not None:
-            res["tp1_qty"] = str(tp1_qty)
-
-        return ok("Order placed with TP/SL + TP1 (reduceOnly) + BE/ATRTrail manager", **res)
+        return ok("Order placed (TP1+BE+ATR trailing manager)", **res)
 
     except Exception as e:
         logging.error("WEBHOOK ERROR: %s", str(e))
